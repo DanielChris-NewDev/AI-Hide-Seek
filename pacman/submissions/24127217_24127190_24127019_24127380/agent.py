@@ -77,6 +77,36 @@ class PacmanAgent(BasePacmanAgent):
                     new_path = path + [move]
                     heappush(frontier, (len(new_path) + heuristic(next_pos), next_pos, new_path))
         return [Move.STAY]
+    
+    def _minimax(self, map_state, p_pos, g_pos, depth, alpha, beta, is_maximizing):
+        """Minimax with Alpha-Beta Pruning to trap the ghost."""
+        # Base case: catch the ghost or reach search limit
+        if depth == 0 or p_pos == g_pos:
+            # Score: Manhattan distance + penalty for ghost having escape routes
+            dist = abs(p_pos[0] - g_pos[0]) + abs(p_pos[1] - g_pos[1])
+            ghost_exits = len(self._get_neighbors(g_pos, map_state))
+            # Pacman wants to MINIMIZE this score
+            return dist + (ghost_exits * 10), None
+
+        if not is_maximizing: # Pacman's Turn (Minimizer)
+            best_score = float('inf')
+            best_move = Move.STAY
+            for next_p, move in self._get_neighbors(p_pos, map_state):
+                score, _ = self._minimax(map_state, next_p, g_pos, depth - 1, alpha, beta, True)
+                if score < best_score:
+                    best_score, best_move = score, move
+                beta = min(beta, score)
+                if beta <= alpha: break # Pruning
+            return best_score, best_move
+        else: # Ghost's Turn (Maximizer)
+            best_score = -float('inf')
+            for next_g, _ in self._get_neighbors(g_pos, map_state):
+                score, _ = self._minimax(map_state, p_pos, next_g, depth - 1, alpha, beta, False)
+                if score > best_score:
+                    best_score = score
+                alpha = max(alpha, score)
+                if beta <= alpha: break # Pruning
+            return best_score, None
 
     def _is_dead_end(self, pos, map_state):
         """Checks if a position is a dead end (only one way out)."""
@@ -124,25 +154,34 @@ class PacmanAgent(BasePacmanAgent):
             Move or (Move, steps): Direction to move (optionally with step count)
         """
         # TODO: Implement your search algorithm here
+        
+        # Calculate distance to decide which strategy to use
+
+        dist = abs(my_position[0] - enemy_position[0]) + abs(my_position[1] - enemy_position[1])
+
+        # --- STRATEGY 1: TRAPPING (Minimax + Alpha-Beta) ---
+        if dist <= 6:
+
+            _, move = self._minimax(map_state, my_position, enemy_position, 4, -float('inf'), float('inf'), False)
+            return (move, 1)
+        
+
+        # --- STRATEGY 2: CHASING (A* + Ghost Prediction) ---
         target = self._predict_ghost_move(enemy_position, my_position, map_state)
         path = self.astar(my_position, target, map_state)
         
         if path and path[0] != Move.STAY:
             first_move = path[0]
             
-            # Count how many steps in the A* path go in the same direction
+            # Count steps in the same direction for speed advantage
             straight_steps_in_path = 0
             for move in path:
                 if move == first_move:
                     straight_steps_in_path += 1
                 else:
-                    break # Stop at the first turn
+                    break
             
-            # The steps we take should be the MINIMUM of:
-            # 1. The speed limit set in terminal (to avoid crashing the loader)
-            # 2. The number of steps until the next turn (to avoid overshooting)
-            # 3. The physical distance to the next wall
-            
+            # Move as fast as possible in a straight line
             allowed_by_path = min(self.pacman_speed, straight_steps_in_path)
             actual_steps = self._max_valid_steps(my_position, first_move, map_state, allowed_by_path)
             
