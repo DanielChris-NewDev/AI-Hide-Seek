@@ -29,6 +29,8 @@ from agent_interface import GhostAgent as BaseGhostAgent
 from environment import Move
 import numpy as np
 
+import heapq
+from collections import deque
 
 from heapq import heappush, heappop
 from agent_interface import PacmanAgent as BasePacmanAgent
@@ -313,158 +315,166 @@ class PacmanAgent(BasePacmanAgent):
 
 class GhostAgent(BaseGhostAgent):
     """
-    Ghost (Hider) Agent - Goal: Avoid being caught
-    
-    Implement your search algorithm to evade Pacman as long as possible.
-    Suggested algorithms: BFS (find furthest point), Minimax, Monte Carlo
+    Advanced Ghost Agent: 'Area-Aware Evader'
+    Strategy: Uses Speed-aware Voronoi Partitioning and Flood Fill 
+    to maximize survival space and avoid dead-ends.
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # TODO: Initialize any data structures you need
-        pass
-    
-    def step(self, map_state: np.ndarray, 
-             my_position: tuple, 
-             enemy_position: tuple,
-             step_number: int) -> Move:
+        self.name = "Area-Aware Evader"
+        # Extract Pacman's speed from environment context
+        self.pacman_max_speed = max(1, int(kwargs.get("pacman_speed", 2)))
+        self.inf_dist = 999
+
+    def _get_area_score(self, pos, map_state, max_depth=5):
         """
-        Decide the next move.
+        Performs a limited-depth Flood Fill to evaluate the 'living space' 
+        available from a given position. Helps detect and avoid dead-ends.
+        """
+        visited = {pos}
+        queue = deque([(pos, 0)])
+        area_size = 0
         
-        Args:
-            map_state: 2D numpy array where 1=wall, 0=empty
-            my_position: Your current (row, col)
-            enemy_position: Pacman's current (row, col)
-            step_number: Current step number (starts at 1)
+        while queue:
+            curr, d = queue.popleft()
+            if d >= max_depth:
+                continue
             
-        Returns:
-            Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
+            for nxt, _ in self._get_neighbor_positions(curr, map_state):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    area_size += 1
+                    queue.append((nxt, d + 1))
+        return area_size
+
+    def step(self, map_state, my_position, enemy_position, step_number):
         """
-        # TODO: Implement your search algorithm here
-        from collections import deque
-
-        def get_manhattan(p1, p2):
-            return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
+        Core decision-making loop. Finds the optimal target cell 
+        within the calculated Safe Zone.
+        """
+        # 1. Map Pacman's potential reach using Speed-aware BFS
+        pacman_steps = self._bfs_speed_dist(map_state, enemy_position, self.pacman_max_speed)
         
-        dist_to_pacman = get_manhattan(my_position, enemy_position)
+        # 2. Map Ghost's reach using standard BFS
+        ghost_dirs = [Move.UP, Move.DOWN, Move.RIGHT, Move.LEFT]
+        ghost_dist = self._bfs_dist(map_state, my_position, ghost_dirs)
 
-        if dist_to_pacman <= 5:
-            def heuristic(g_pos, p_pos):
-                score = get_manhattan(g_pos, p_pos) * 10
+        best_target = None
+        best_score = -1
+
+        # 3. Voronoi Selection: Filter for cells Ghost can reach before Pacman
+        for pos, gd in ghost_dist.items():
+            if gd == 0: continue
+            
+            ps = pacman_steps.get(pos, self.inf_dist)
+            
+            # Safe Zone logic: ghost_steps <= pacman_steps
+            if gd <= ps:
+                # Heuristic: Balance between distance from seeker and future mobility
+                area_val = self._get_area_score(pos, map_state, max_depth=5)
+                score = ps * 200 + area_val * 50
                 
-                moves_available = len(self.get_neighbors(g_pos, map_state))
-                if moves_available <= 1:
-                    score -= 10000 
-                elif moves_available >= 3:
-                    score += 50
-                return score
+                if score > best_score:
+                    best_score = score
+                    best_target = pos
 
-            def minimax(g_pos, p_pos, depth, is_maximizing):
-                if depth == 0:
-                    return heuristic(g_pos, p_pos), None
-                
-                if is_maximizing:
-                    best_score, best_move = -float('inf'), Move.STAY
-                    for nxt_g, m in self.get_neighbors(g_pos, map_state):
-                        score, _ = minimax(nxt_g, p_pos, depth - 1, False)
-                        if score > best_score:
-                            best_score, best_move = score, m
-                    return best_score, best_move
-                else:
-                    best_score = float('inf')
-                    for nxt_p, _ in self.get_neighbors(p_pos, map_state):
-                        score, _ = minimax(g_pos, nxt_p, depth - 1, True)
-                        if score < best_score:
-                            best_score = score
-                    return best_score, None
+        # 4. Navigate to the best safe target using A*
+        if best_target is not None:
+            path = self._astar_one_step(map_state, my_position, best_target)
+            if path and len(path) >= 2:
+                return self._get_move_from_positions(my_position, path[1])
 
-            _, chosen_move = minimax(my_position, enemy_position, 3, True)
-            return chosen_move
-        
-        else:
-            def get_distance_map(start_pos):
-                dist_map = {start_pos: 0}
-                queue_local = deque([start_pos])
-                while queue_local:
-                    curr = queue_local.popleft()
-                    for nxt, _ in self.get_neighbors(curr, map_state):
-                        if nxt not in dist_map:
-                            dist_map[nxt] = dist_map[curr] + 1
-                            queue_local.append(nxt)
-                return dist_map
+        # 5. Fallback: If cornered, execute greedy evasion
+        return self._greedy_evade(map_state, my_position, pacman_steps)
 
-            pacman_dist = get_distance_map(enemy_position)
-            ghost_dist = get_distance_map(my_position)
+    # --- Search Algorithms ---
 
-            target_cell = None
-            max_p_steps = -1
-            for cell, g_steps in ghost_dist.items():
-                p_steps = pacman_dist.get(cell, 9999)
-                if g_steps < p_steps:
-                    if p_steps > max_p_steps:
-                        max_p_steps = p_steps
-                        target_cell = cell
+    def _bfs_dist(self, map_state, start, dirs):
+        """Standard BFS to calculate step distance to all reachable cells."""
+        dist = {start: 0}
+        queue = deque([start])
+        while queue:
+            p = queue.popleft()
+            d = dist[p]
+            for mv in dirs:
+                nxt = (p[0] + mv.value[0], p[1] + mv.value[1])
+                if nxt not in dist and self._is_valid(nxt, map_state):
+                    dist[nxt] = d + 1
+                    queue.append(nxt)
+        return dist
 
-            if target_cell and target_cell != my_position:
-                path_queue = deque([(my_position, [])])
-                visited = {my_position}
-                while path_queue:
-                    curr_p, path = path_queue.popleft()
-                    if curr_p == target_cell:
-                        return path[0]
-                    for nxt, m in self.get_neighbors(curr_p, map_state):
-                        if nxt not in visited:
-                            visited.add(nxt)
-                            path_queue.append((nxt, path + [m]))
+    def _bfs_speed_dist(self, map_state, start, max_speed):
+        """
+        Speed-aware BFS: Accounts for Pacman's ability to dash up to 
+        'max_speed' cells in a straight line per game turn.
+        """
+        dist = {start: 0}
+        queue = deque([start])
+        while queue:
+            p = queue.popleft()
+            d = dist[p]
+            for mv in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                for n in range(1, max_speed + 1):
+                    nxt = (p[0] + mv.value[0] * n, p[1] + mv.value[1] * n)
+                    if not self._is_valid(nxt, map_state): break
+                    if nxt not in dist:
+                        dist[nxt] = d + 1
+                        queue.append(nxt)
+        return dist
 
-        # Example: Simple evasive approach (replace with your algorithm)
-        row_diff = my_position[0] - enemy_position[0]
-        col_diff = my_position[1] - enemy_position[1]
-        
-        # Try to move away from Pacman
-        if abs(row_diff) > abs(col_diff):
-            move = Move.DOWN if row_diff > 0 else Move.UP
-        else:
-            move = Move.RIGHT if col_diff > 0 else Move.LEFT
-        
-        # Check if move is valid
-        if self._is_valid_move(my_position, move, map_state):
-            return move
-        
-        # If not valid, try other moves
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            if self._is_valid_move(my_position, move, map_state):
-                return move
-        
-        return Move.STAY
-    
-    # Helper methods (you can add more)
-    def get_neighbors(self, pos: tuple, map_state: np.ndarray):
-        """Find all valid neighboring squares and the move to get there."""
+    def _astar_one_step(self, map_state, start, goal):
+        """Standard A* search for single-step navigation."""
+        if start == goal: return [start]
+        def h(p): return abs(p[0] - goal[0]) + abs(p[1] - goal[1])
+        heap = [(h(start), 0, start)]
+        came_from = {}; g_score = {start: 0}
+        while heap:
+            _, cost, p = heapq.heappop(heap)
+            if p == goal:
+                path = [p]
+                while p in came_from: p = came_from[p]; path.append(p)
+                return path[::-1]
+            for nxt, move in self._get_neighbor_positions(p, map_state):
+                new_g = cost + 1
+                if new_g < g_score.get(nxt, self.inf_dist):
+                    g_score[nxt] = new_g; came_from[nxt] = p
+                    heapq.heappush(heap, (new_g + h(nxt), new_g, nxt))
+        return None
+
+    def _greedy_evade(self, map_state, my_pos, pacman_dist_map):
+        """
+        Heuristic-based greedy evasion used when no safe zone is available.
+        """
+        best_mv = Move.STAY
+        best_score = pacman_dist_map.get(my_pos, 0) * 100 + self._get_area_score(my_pos, map_state) * 10
+        for nxt, mv in self._get_neighbor_positions(my_pos, map_state):
+            score = pacman_dist_map.get(nxt, 0) * 100 + self._get_area_score(nxt, map_state) * 10
+            if score > best_score:
+                best_score = score; best_mv = mv
+        return best_mv
+
+    # --- Utility Methods ---
+
+    def _get_neighbor_positions(self, pos, map_state):
+        """Returns valid adjacent positions and their corresponding Move enum."""
         neighbors = []
-        for move_enum in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            dr, dc = move_enum.value
-            nxt = (pos[0] + dr, pos[1] + dc)
-            if self._is_valid_position(nxt, map_state):
-                neighbors.append((nxt, move_enum))
+        for mv in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            nxt = (pos[0] + mv.value[0], pos[1] + mv.value[1])
+            if self._is_valid(nxt, map_state): neighbors.append((nxt, mv))
         return neighbors
-    
-    def _is_valid_move(self, pos: tuple, move: Move, map_state: np.ndarray) -> bool:
-        """Check if a move from pos is valid."""
-        delta_row, delta_col = move.value
-        new_pos = (pos[0] + delta_row, pos[1] + delta_col)
-        return self._is_valid_position(new_pos, map_state)
-    
-    def _is_valid_position(self, pos: tuple, map_state: np.ndarray) -> bool:
-        """Check if a position is valid (not a wall and within bounds)."""
-        row, col = pos
-        height, width = map_state.shape
-        
-        if row < 0 or row >= height or col < 0 or col >= width:
-            return False
-        
-        return map_state[row, col] == 0
 
+    def _is_valid(self, pos, map_state):
+        """Checks map boundaries and wall collisions."""
+        r, c = pos; h, w = map_state.shape
+        return 0 <= r < h and 0 <= c < w and map_state[r, c] == 0
+
+    def _get_move_from_positions(self, from_pos, to_pos):
+        """Translates a coordinate delta into a Move enum."""
+        dr, dc = to_pos[0] - from_pos[0], to_pos[1] - from_pos[1]
+        for mv in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            if mv.value == (dr, dc): return mv
+        return Move.STAY
 
 # class GhostAgent(BaseGhostAgent):
 #     """
