@@ -163,6 +163,15 @@ class GhostAgent(BaseGhostAgent):
         # TODO: Initialize any data structures you need
         # Memory for limited observation mode
         self.last_known_enemy_pos = None
+        # Belief map to track danger levels across the 21x21 grid
+        self.belief_map = np.zeros((21, 21))
+        # Standard directions for vision and neighbor checks
+        self.directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        # Path History (To avoid pacing back and forth)
+        self.history = []
+        self.max_history = 10 
+        # When we lose line-of-sight, we use this to change behavior
+        self.stealth_timer = 0
     
     def step(self, map_state: np.ndarray, 
              my_position: tuple, 
@@ -196,26 +205,55 @@ class GhostAgent(BaseGhostAgent):
                     return move
             return Move.STAY
         
-        # Example: Simple evasive approach (replace with your algorithm)
-        row_diff = my_position[0] - threat[0]
-        col_diff = my_position[1] - threat[1]
-        
-        # Try to move away from Pacman
-        if abs(row_diff) > abs(col_diff):
-            move = Move.DOWN if row_diff > 0 else Move.UP
+        # 1. Update memory and the Belief Map (Danger in the fog)
+        if enemy_position is not None:
+            self.last_known_enemy_pos = enemy_position
+            # Reset belief: if we see him, we know exactly where danger is
+            self.belief_map.fill(0)
+            self.belief_map[enemy_position] = 100
         else:
-            move = Move.RIGHT if col_diff > 0 else Move.LEFT
+            # Increase 'danger' score in unseen areas (-1) 
+            # This implements the "Belief-Map Evacuation" strategy
+            self.belief_map[map_state == -1] += 0.5
+            if self.last_known_enemy_pos:
+                # Slowly fade the old sighting
+                self.belief_map[self.last_known_enemy_pos] *= 0.9 
+
+        # 2. Start the Risk-Aversion Algorithm
+        best_move = Move.STAY
+        min_risk = float('inf')
         
-        # Check if move is valid
-        if self._is_valid_move(my_position, move, map_state):
-            return move
+        # We evaluate all 5 possible actions
+        possible_moves = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY]
         
-        # If not valid, try other moves
-        for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-            if self._is_valid_move(my_position, move, map_state):
-                return move
-        
-        return Move.STAY
+        for move in possible_moves:
+            # Skip moves that hit walls
+            if not self._is_valid_move(my_position, move, map_state):
+                continue
+            
+            # Calculate coordinates for the potential move
+            delta_r, delta_c = move.value
+            new_pos = (my_position[0] + delta_r, my_position[1] + delta_c)
+            
+            # Evaluate the 'Risk Score' for this new position
+            risk = self._calculate_risk(new_pos, map_state, enemy_position)
+
+            # Penalize cells we recently stood in to prevent "vibrating" or staying still too long
+            if new_pos in self.history:
+                risk += 25 
+
+            # Keep track of the safest option
+            if risk < min_risk:
+                min_risk = risk
+                best_move = move
+
+            # At the very end of step(), update the history
+            self.history.append(my_position)
+            if len(self.history) > self.max_history:
+                self.history.pop(0)
+
+        # 3. Final decision: Return the move with the absolute lowest risk
+        return best_move
     
     # Helper methods (you can add more)
     
@@ -234,3 +272,72 @@ class GhostAgent(BaseGhostAgent):
             return False
         
         return map_state[row, col] == 0
+    
+    def _calculate_risk(self, pos: tuple, map_state: np.ndarray, enemy_pos: tuple) -> float:
+        risk = 0.0
+        r, c = pos
+        threat = enemy_pos or self.last_known_enemy_pos
+
+        if threat:
+            tr, tc = threat
+            
+            # 1. THE SHADOW CHECK
+            # If we are in the same row or same column, we might be visible
+            if r == tr or c == tc:
+                # Check if there is a wall between us and the threat
+                if not self._is_wall_between(pos, threat, map_state):
+                    risk += 100  # EXTREME danger: we are in his line of sight!
+            else:
+                # We are diagonal to him! This is a "Shadow."
+                # We reward this by not adding risk, or even subtracting a little.
+                risk -= 5 
+
+            # 2. PROXIMITY (Standard distance penalty)
+            dist = abs(r - tr) + abs(c - tc)
+            if dist < 4:
+                risk += 40
+                
+        # C. MOBILITY BONUS: Prefer cells with many exits
+        open_neighbors = self._count_neighbors(pos, map_state)
+        if open_neighbors >= 3:
+            risk -= 20  # Reward intersections
+        elif open_neighbors == 1:
+            risk += 80  # Heavily penalize dead ends
+
+        # D. EXPLORATION REWARD: Prefer moving into the unknown
+        if map_state[pos] == -1:
+            risk -= 15
+
+        # 3. DEAD END CHECK (Connectivity)
+        if self._count_neighbors(pos, map_state) <= 1:
+            risk += 80
+
+        # 4. FOG DANGER (Belief Map)
+        risk += self.belief_map[pos]
+
+        return risk
+    
+    def _is_wall_between(self, pos1: tuple, pos2: tuple, map_state: np.ndarray) -> bool:
+        r1, c1 = pos1
+        r2, c2 = pos2
+        
+        # If in the same row, check all columns between them
+        if r1 == r2:
+            for c in range(min(c1, c2) + 1, max(c1, c2)):
+                if map_state[r1, c] == 1:
+                    return True
+        # If in the same column, check all rows between them
+        elif c1 == c2:
+            for r in range(min(r1, r2) + 1, max(r1, r2)):
+                if map_state[r, c1] == 1:
+                    return True
+                    
+        return False
+
+    def _count_neighbors(self, pos, map_state):
+        count = 0
+        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+            nr, nc = pos[0]+dr, pos[1]+dc
+            if 0 <= nr < 21 and 0 <= nc < 21 and map_state[nr, nc] != 1:
+                count += 1
+        return count
