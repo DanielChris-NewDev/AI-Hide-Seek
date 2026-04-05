@@ -386,34 +386,60 @@ class GhostAgent(BaseGhostAgent):
 
         # --- THE "FORCE EXIT" OVERRIDE ---
         if r == hallway_row:
-            # 1. Look at every possible move
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                delta_r, delta_c = move.value
-                next_r = r + delta_r
-                next_c = c + delta_c
-                
-                # 2. If the move takes us OFF the hallway row, and it's NOT a wall...
-                if next_r != hallway_row:
-                    if 0 <= next_r < 21 and map_state[next_r, next_c] != 1:
-                        # VALID EXIT DETECTED - TAKE IT NOW
-                        self.history.append(my_position)
-                        return move
+            # Ưu tiên lấy vị trí mối đe dọa (từ đầu hàm step của ông)
+            threat = enemy_position or self.last_known_enemy_pos
 
-            # 3. If no vertical exit, find the nearest exit column
+            # 1. TÌM LỐI THOÁT DỌC (LÊN/XUỐNG) TẠI CHỖ NHƯNG PHẢI AN TOÀN
+            safe_exits = []
+            for move in [Move.UP, Move.DOWN]:
+                if self._is_valid_move(my_position, move, map_state):
+                    # Nếu thấy Pacman, không được đi về hướng làm khoảng cách gần lại
+                    if threat:
+                        next_r = r + move.value[0]
+                        next_c = c + move.value[1]
+                        dist_now = abs(r - threat[0]) + abs(c - threat[1])
+                        dist_next = abs(next_r - threat[0]) + abs(next_c - threat[1])
+                        if dist_next < dist_now:
+                            continue # Bỏ qua, đi hướng này là đâm đầu vào chỗ chết
+                    safe_exits.append(move)
+            
+            # Có lối dọc an toàn thì đi luôn
+            if safe_exits:
+                self.history.append(my_position)
+                return safe_exits[0]
+
+            # 2. NẾU KHÔNG CÓ LỐI DỌC, TÌM CỘT THOÁT HIỂM AN TOÀN NHẤT
             exit_cols = []
             for col_idx in range(map_state.shape[1]):
-                # Check row 9 and row 11 for any opening
-                if map_state[9, col_idx] != 1 or map_state[11, col_idx] != 1:
+                # map_state != 1 là đúng, vì tường luôn là 1 (nhìn xuyên sương mù)
+                if map_state[r-1, col_idx] != 1 or map_state[r+1, col_idx] != 1:
                     exit_cols.append(col_idx)
-            
+
             if exit_cols:
-                target_col = min(exit_cols, key=lambda x: abs(x - c))
-                if target_col < c:
-                    self.history.append(my_position)
-                    return Move.LEFT
-                elif target_col > c:
-                    self.history.append(my_position)
-                    return Move.RIGHT
+                best_col = None
+                min_risk_score = float('inf')
+                
+                for col in exit_cols:
+                    # Điểm rủi ro cơ bản là khoảng cách tới cửa
+                    score = abs(col - c)
+                    
+                    # Nếu Pacman đang chặn ở hướng đó, phạt điểm cực nặng để né
+                    if threat:
+                        if (c <= col <= threat[1]) or (c >= col >= threat[1]):
+                            score += 100 
+                    
+                    if score < min_risk_score:
+                        min_risk_score = score
+                        best_col = col
+
+                # 3. DI CHUYỂN NGANG (PHẢI CÓ CHECK TƯỜNG CẢN)
+                if best_col is not None:
+                    if best_col < c and self._is_valid_move(my_position, Move.LEFT, map_state):
+                        self.history.append(my_position)
+                        return Move.LEFT
+                    elif best_col > c and self._is_valid_move(my_position, Move.RIGHT, map_state):
+                        self.history.append(my_position)
+                        return Move.RIGHT
         
         # Update memory if enemy is visible
         if enemy_position is not None:
@@ -494,53 +520,63 @@ class GhostAgent(BaseGhostAgent):
     def _calculate_risk(self, pos: tuple, map_state: np.ndarray, enemy_pos: tuple) -> float:
         risk = 0.0
         r, c = pos
-        hallway_row = 10
         threat = enemy_pos or self.last_known_enemy_pos
-
-        # 1. HALLWAY EMERGENCY LOGIC (Top Priority)
-        if r == hallway_row:
-            risk += 150  # Huge penalty for staying in the open row
-            
-            # Look for an exit: Is there a non-wall above or below this cell?
-            # We check the map bounds and walls to find a "doorway"
-            can_exit_up = (r > 0 and map_state[r-1, c] != 1)
-            can_exit_down = (r < 20 and map_state[r+1, c] != 1)
-            
-            if can_exit_up or can_exit_down:
-                risk -= 120 # Found a door! Move here to get off the hallway next turn
-        else:
-            # Huge reward for being in side corridors (off row 10)
-            risk -= 100 
+        
+        # Tốc độ và tầm bắt của Pacman (mặc định lấy 2 để an toàn)
+        p_speed = getattr(self, 'pacman_speed', 2) 
+        cap_dist = 2 # Capture distance threshold
 
         if threat:
             tr, tc = threat
+            # Khoảng cách Manhattan giữa Ghost và Pacman
             dist = abs(r - tr) + abs(c - tc)
             
-            # 2. THE SHADOW CHECK
+            # 1. NGƯỠNG TỬ THẦN (DEATH ZONE)
+            # Ngưỡng nguy hiểm = Tốc độ + Tầm bắt (Vd: 2 + 2 = 4 ô)
+            danger_threshold = p_speed + cap_dist
+            if dist <= danger_threshold:
+                # Phạt cực nặng bằng hàm mũ để Ghost ưu tiên quay đầu xe ngay lập tức
+                risk += 10000 / (dist + 0.1) 
+            elif dist <= 8:
+                # Cảnh báo sớm khi Pacman ở gần
+                risk += 1000 / dist
+
+            # 2. KIỂM TRA TẦM NHÌN THẲNG (LINE OF SIGHT - LOS)
+            # Nếu đứng cùng hàng/cột và KHÔNG có tường chắn -> Pacman speed 2 sẽ "vọt" tới rất nhanh
             if r == tr or c == tc:
                 if not self._is_wall_between(pos, threat, map_state):
-                    risk += 150  # Line of sight is death in the hallway
-            else:
-                risk -= 10 # Diagonal safety
+                    risk += 2000 # Tăng rủi ro vì hành lang không có chỗ nấp
 
-            # 3. PROXIMITY (Modified for Speed-2 Pacman)
-            # If Pacman is close, risk scales up much faster
-            if dist < 6:
-                risk += (60 - (dist * 10))
+        # 3. PHÂN TÍCH ĐỊA HÌNH (TOPOLOGY)
+        neighbors = self._count_neighbors(pos, map_state)
+        if neighbors >= 3:
+            # "Thưởng" cho ngã ba/tư: Đây là nơi Ghost dễ bẻ lái để Pacman mất dấu (Fog of War)
+            risk -= 300 
+        elif neighbors <= 1:
+            # Ngõ cụt: Phạt nặng nhất vì đây là cái bẫy không lối thoát
+            risk += 5000 
 
-        # 4. MOBILITY & CONNECTIVITY
-        open_neighbors = self._count_neighbors(pos, map_state)
-        if open_neighbors >= 3:
-            risk -= 20  # Intersections are escape routes
-        elif open_neighbors <= 1:
-            risk += 150 # Dead ends are absolute traps
+        # 4. TRÁNH "LẦY" TẠI CHỖ (ANTI-VIBRATION)
+        # Nếu ô đã đứng nhiều lần trong quá khứ thì tăng rủi ro để Ghost di chuyển chỗ mới
+        if pos in self.history:
+            occurrence = self.history.count(pos)
+            risk += (occurrence * 150)
 
-        # 5. FOG & EXPLORATION
-        if map_state[pos] == -1:
-            risk -= 15
-        risk += self.belief_map[pos]
+        # 5. CHIẾN THUẬT "TÀU NGẦM" (STEALTH MODE)
+        # Ưu tiên di chuyển vào vùng mù (-1) để tận dụng Limited Vision của Pacman
+        if map_state[r, c] == -1: # Unseen cell [cite: 33]
+            risk -= 100 
 
         return risk
+
+    def _count_neighbors(self, pos, map_state):
+        """Đếm số ô trống có thể đi từ vị trí hiện tại[cite: 31, 32]."""
+        count = 0
+        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+            nr, nc = pos[0]+dr, pos[1]+dc
+            if 0 <= nr < 21 and 0 <= nc < 21 and map_state[nr, nc] != 1:
+                count += 1
+        return count
     
     def _is_wall_between(self, pos1: tuple, pos2: tuple, map_state: np.ndarray) -> bool:
         r1, c1 = pos1
