@@ -380,6 +380,40 @@ class GhostAgent(BaseGhostAgent):
             Move: One of Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT, Move.STAY
         """
         # TODO: Implement your search algorithm here
+
+        r, c = my_position
+        hallway_row = 10 
+
+        # --- THE "FORCE EXIT" OVERRIDE ---
+        if r == hallway_row:
+            # 1. Look at every possible move
+            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+                delta_r, delta_c = move.value
+                next_r = r + delta_r
+                next_c = c + delta_c
+                
+                # 2. If the move takes us OFF the hallway row, and it's NOT a wall...
+                if next_r != hallway_row:
+                    if 0 <= next_r < 21 and map_state[next_r, next_c] != 1:
+                        # VALID EXIT DETECTED - TAKE IT NOW
+                        self.history.append(my_position)
+                        return move
+
+            # 3. If no vertical exit, find the nearest exit column
+            exit_cols = []
+            for col_idx in range(map_state.shape[1]):
+                # Check row 9 and row 11 for any opening
+                if map_state[9, col_idx] != 1 or map_state[11, col_idx] != 1:
+                    exit_cols.append(col_idx)
+            
+            if exit_cols:
+                target_col = min(exit_cols, key=lambda x: abs(x - c))
+                if target_col < c:
+                    self.history.append(my_position)
+                    return Move.LEFT
+                elif target_col > c:
+                    self.history.append(my_position)
+                    return Move.RIGHT
         
         # Update memory if enemy is visible
         if enemy_position is not None:
@@ -388,13 +422,7 @@ class GhostAgent(BaseGhostAgent):
         # Use current sighting, fallback to last known, or move randomly
         threat = enemy_position or self.last_known_enemy_pos
         
-        if threat is None:
-            # No information about enemy - move randomly
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                if self._is_valid_move(my_position, move, map_state):
-                    return move
-            return Move.STAY
-        
+
         # 1. Update memory and the Belief Map (Danger in the fog)
         if enemy_position is not None:
             self.last_known_enemy_pos = enemy_position
@@ -437,7 +465,7 @@ class GhostAgent(BaseGhostAgent):
                 min_risk = risk
                 best_move = move
 
-            # At the very end of step(), update the history
+        # At the very end of step(), update the history
             self.history.append(my_position)
             if len(self.history) > self.max_history:
                 self.history.pop(0)
@@ -466,43 +494,50 @@ class GhostAgent(BaseGhostAgent):
     def _calculate_risk(self, pos: tuple, map_state: np.ndarray, enemy_pos: tuple) -> float:
         risk = 0.0
         r, c = pos
+        hallway_row = 10
         threat = enemy_pos or self.last_known_enemy_pos
+
+        # 1. HALLWAY EMERGENCY LOGIC (Top Priority)
+        if r == hallway_row:
+            risk += 150  # Huge penalty for staying in the open row
+            
+            # Look for an exit: Is there a non-wall above or below this cell?
+            # We check the map bounds and walls to find a "doorway"
+            can_exit_up = (r > 0 and map_state[r-1, c] != 1)
+            can_exit_down = (r < 20 and map_state[r+1, c] != 1)
+            
+            if can_exit_up or can_exit_down:
+                risk -= 120 # Found a door! Move here to get off the hallway next turn
+        else:
+            # Huge reward for being in side corridors (off row 10)
+            risk -= 100 
 
         if threat:
             tr, tc = threat
-            
-            # 1. THE SHADOW CHECK
-            # If we are in the same row or same column, we might be visible
-            if r == tr or c == tc:
-                # Check if there is a wall between us and the threat
-                if not self._is_wall_between(pos, threat, map_state):
-                    risk += 100  # EXTREME danger: we are in his line of sight!
-            else:
-                # We are diagonal to him! This is a "Shadow."
-                # We reward this by not adding risk, or even subtracting a little.
-                risk -= 5 
-
-            # 2. PROXIMITY (Standard distance penalty)
             dist = abs(r - tr) + abs(c - tc)
-            if dist < 4:
-                risk += 40
-                
-        # C. MOBILITY BONUS: Prefer cells with many exits
+            
+            # 2. THE SHADOW CHECK
+            if r == tr or c == tc:
+                if not self._is_wall_between(pos, threat, map_state):
+                    risk += 150  # Line of sight is death in the hallway
+            else:
+                risk -= 10 # Diagonal safety
+
+            # 3. PROXIMITY (Modified for Speed-2 Pacman)
+            # If Pacman is close, risk scales up much faster
+            if dist < 6:
+                risk += (60 - (dist * 10))
+
+        # 4. MOBILITY & CONNECTIVITY
         open_neighbors = self._count_neighbors(pos, map_state)
         if open_neighbors >= 3:
-            risk -= 20  # Reward intersections
-        elif open_neighbors == 1:
-            risk += 80  # Heavily penalize dead ends
+            risk -= 20  # Intersections are escape routes
+        elif open_neighbors <= 1:
+            risk += 150 # Dead ends are absolute traps
 
-        # D. EXPLORATION REWARD: Prefer moving into the unknown
+        # 5. FOG & EXPLORATION
         if map_state[pos] == -1:
             risk -= 15
-
-        # 3. DEAD END CHECK (Connectivity)
-        if self._count_neighbors(pos, map_state) <= 1:
-            risk += 80
-
-        # 4. FOG DANGER (Belief Map)
         risk += self.belief_map[pos]
 
         return risk
