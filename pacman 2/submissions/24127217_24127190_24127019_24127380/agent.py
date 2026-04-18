@@ -23,7 +23,7 @@ IMPORTANT:
 import sys
 from pathlib import Path
 import heapq
-
+from collections import deque
 # Add src to path to import the interface
 src_path = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(src_path))
@@ -152,193 +152,198 @@ import numpy as np
 
 class PacmanAgent(BasePacmanAgent):
     """
-    The Omniscient Predator - Pacman Agent
-    Strategy: Particle Filter (Markov Localization) combined with Speed-aware A*.
-    Features:
-    - Take advantage of visibility in the fog using probabilistic tracking.
-    - Corners the enemy at choke points (junctions).
-    - Dashes at high speed through the fog by utilizing the static wall map.
+    =======================================================================
+    V_INTERCEPTOR: THE MATH PREDATOR
+    - Mathematical Interception: Calculates the exact intersection point 
+      based on Pacman (speed 2) vs Ghost (speed 1).
+    - Corners the Ghost at the center (Mid) before it scatters into alleys.
+    - O(1) Cache Speed + Hard Loop Prevention (1000 points penalty).
+    =======================================================================
     """
-    
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.name = "Omniscient Predator"
+        self.name = "Interceptor"
         self.pacman_speed = max(1, int(kwargs.get("pacman_speed", 1)))
         
-        # Probability matrix for Ghost's location (Belief State)
         self.belief = None
+        self.history = deque(maxlen=6) 
+        
+        self.apsp = {} 
+        self.valid_cells = []
+        self.spawn_center = None
+        self.is_map_cached = False
+        
+        self.rush_mode = True 
+        self.meeting_point = None  # Interception point
 
+    # =========================================================
+    # 1. CACHE COMPUTATION & GHOST SPAWN DETECTION
+    # =========================================================
+    def _cache_map_and_spawn(self, map_state):
+        h, w = map_state.shape
+        self.valid_cells = [(r, c) for r in range(h) for c in range(w) if map_state[r, c] != 1]
+        
+        # Find the center of the Ghost spawn (Assumed to be in the upper-middle area)
+        spawns = [(r, c) for r, c in self.valid_cells if r < h * 0.4 and w * 0.3 < c < w * 0.7]
+        self.spawn_center = spawns[len(spawns)//2] if spawns else self.valid_cells[0]
+
+        # O(1) All-Pairs Shortest Path (APSP) computation for instant lookups
+        for start in self.valid_cells:
+            q = deque([(start, 0)])
+            visited = {start}
+            while q:
+                curr, d = q.popleft()
+                self.apsp[(start, curr)] = d
+                for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+                    nr, nc = curr[0]+dr, curr[1]+dc
+                    if 0 <= nr < h and 0 <= nc < w and map_state[nr, nc] != 1 and (nr, nc) not in visited:
+                        visited.add((nr, nc))
+                        q.append(((nr, nc), d+1))
+        self.is_map_cached = True
+
+    def _dist(self, p1, p2):
+        return self.apsp.get((p1, p2), 9999)
+
+    # =========================================================
+    # 2. DESTRUCTION LOOP (MAIN AGENT LOGIC)
+    # =========================================================
     def step(self, map_state: np.ndarray, my_position: tuple, enemy_position: tuple, step_number: int):
         h, w = map_state.shape
-        
-        # 1. INITIALIZE BELIEF STATE (Focus on Top 40% map - Ghost's default spawn)
+        if not self.is_map_cached: self._cache_map_and_spawn(map_state)
+
+        # Cancel Rush mode if the Ghost is spotted or the interception point is reached but empty
+        if enemy_position is not None or my_position == self.meeting_point:
+            self.rush_mode = False
+
+        # --- STEP 1: PROBABILITY RADAR (BELIEF STATE) ---
         if self.belief is None:
             self.belief = np.zeros((h, w), dtype=float)
-            # According to environment rules, Ghost spawns in the top 40% of the map
-            top_bound = int(h * 0.4)
-            valid_spawn_cells = 0
-            for r in range(top_bound):
-                for c in range(w):
-                    # Wall = 1, Traversable != 1
-                    if map_state[r, c] != 1: 
-                        self.belief[r, c] = 1.0
-                        valid_spawn_cells += 1
-            if valid_spawn_cells > 0:
-                self.belief /= valid_spawn_cells
+            self.belief[self.spawn_center] = 1.0  # 100% chance Ghost spawns here
+            self.belief /= self.belief.sum()
 
-        # 2. TIME UPDATE: Simulate Ghost's evasive behavior (Probability Diffusion)
-        # Only diffuse when the game has started (step > 1) and Ghost is unseen
-        if step_number > 1 and enemy_position is None:
-            new_belief = np.zeros((h, w), dtype=float)
-            for r in range(h):
-                for c in range(w):
-                    if self.belief[r, c] > 0:
-                        transitions = self._simulate_ghost_transition_probs((r, c), my_position, map_state)
-                        for (nr, nc), prob in transitions:
-                            new_belief[nr, nc] += self.belief[r, c] * prob
-            self.belief = new_belief
-
-        # 3. OBSERVATION UPDATE: Update beliefs based on cross-shaped radar
         if enemy_position is not None:
-            # Ghost spotted: Assign 100% probability to that exact cell
             self.belief.fill(0.0)
-            self.belief[enemy_position[0], enemy_position[1]] = 1.0
+            self.belief[enemy_position] = 1.0
             target = enemy_position
         else:
-            # Ghost not seen: Eliminate probabilities in currently visible cells (map_state == 0)
+            if step_number > 1:
+                new_belief = np.zeros((h, w), dtype=float)
+                for r in range(h):
+                    for c in range(w):
+                        if self.belief[r, c] > 0:
+                            moves = [(r+dr, c+dc) for dr, dc in [(-1,0), (1,0), (0,-1), (0,1), (0,0)]
+                                     if 0 <= r+dr < h and 0 <= c+dc < w and map_state[r+dr, c+dc] != 1]
+                            dists = [self._dist(m, my_position) for m in moves]
+                            weights = np.array(dists, dtype=float) ** 2
+                            probs = weights / weights.sum() if weights.sum() > 0 else np.ones(len(moves))/len(moves)
+                            for m, prob in zip(moves, probs):
+                                new_belief[m] += self.belief[r, c] * prob
+                self.belief = new_belief
+
             self.belief[map_state == 0] = 0.0
-            
-            # Normalize the belief matrix
-            total_prob = self.belief.sum()
-            if total_prob > 0:
-                self.belief /= total_prob
-            else:
-                # Failsafe fallback if tracking is completely lost
-                self.belief = (map_state != 1).astype(float)
+            self.belief[my_position] = 0.0  # Force clear current position (Ghost cannot be where Pacman is)
+
+            if self.belief.sum() > 0:
                 self.belief /= self.belief.sum()
+            else:
+                # Failsafe: Reset belief state if tracking is completely lost
+                self.rush_mode = False 
+                self.belief = (map_state != 1).astype(float)
+                self.belief[map_state == 0] = 0.0
+                self.belief[my_position] = 0.0
+                if self.belief.sum() > 0: self.belief /= self.belief.sum()
 
-            # 4. TARGET SELECTION: Prioritize Choke Points (Junctions) with max probability
-            max_prob = np.max(self.belief)
-            candidates = np.argwhere(self.belief == max_prob)
-            
-            def score_candidate(c):
-                r, col = c[0], c[1]
-                dist = abs(r - my_position[0]) + abs(col - my_position[1])
+            # --- TARGET SELECTION LOGIC (CORE INTERCEPTION) ---
+            if self.rush_mode:
+                # CALCULATE INTERSECTION POINT BASED ON SPEED 2 (Pacman) vs 1 (Ghost)
+                # Find the cell closest to the Ghost spawn that Pacman can reach in time
+                best_meet = self.spawn_center
+                min_ghost_dist = float('inf')
                 
-                # Count available exits
-                exits = 0
-                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nr, nc = r + dr, col + dc
-                    if 0 <= nr < h and 0 <= nc < w and map_state[nr, nc] != 1:
-                        exits += 1
-                
-                # Lower score is better. Subtract points for junctions to prioritize them.
-                return dist - (exits * 3)
-                
-            best_target = min(candidates, key=score_candidate)
-            target = tuple(best_target)
+                for cell in self.valid_cells:
+                    d_pacman = self._dist(my_position, cell)
+                    d_ghost = self._dist(self.spawn_center, cell)
+                    
+                    # If Pacman reaches this point equal to or before the Ghost (Pacman speed x2)
+                    if d_pacman <= d_ghost * 2:
+                        # Prefer points as close to the Ghost spawn as possible (choke them at the source)
+                        if d_ghost < min_ghost_dist:
+                            min_ghost_dist = d_ghost
+                            best_meet = cell
+                            
+                self.meeting_point = best_meet
+                target = self.meeting_point
+            else:
+                # Mid-game: Track the highest probability
+                target = np.unravel_index(np.argmax(self.belief), self.belief.shape)
 
-        # 5. KILL SHOT (Straight-line Sprint)
-        # If the enemy is in direct line of sight with no obstacles, dash at max speed
-        if enemy_position is not None:
-            dist = abs(my_position[0] - enemy_position[0]) + abs(my_position[1] - enemy_position[1])
-            direct_mv = self._get_line_of_sight_move(my_position, enemy_position, map_state)
-            if direct_mv and dist <= self.pacman_speed:
-                return (direct_mv, dist)
-
-        # 6. A* SPEED ENGINE: Find the fastest path to the Target
-        move, steps = self._astar_speed_engine(map_state, my_position, target)
-        return (move, steps)
-
-    # ==========================================
-    # HELPER FUNCTIONS
-    # ==========================================
-
-    def _simulate_ghost_transition_probs(self, g_pos, p_pos, map_state):
-        """Simulates Ghost's psychology: Prioritizes moving away from Pacman."""
-        h, w = map_state.shape
+        # --- STEP 2: PURSUIT PATHFINDING (NO STAY, NO LOOPS) ---
         valid_moves = []
-        
-        # Ghost can move in 4 cardinal directions or STAY
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1), (0, 0)]:
-            nr, nc = g_pos[0] + dr, g_pos[1] + dc
+        for m in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
+            nr, nc = my_position[0] + m.value[0], my_position[1] + m.value[1]
             if 0 <= nr < h and 0 <= nc < w and map_state[nr, nc] != 1:
-                valid_moves.append((nr, nc))
-                
-        # Calculate Manhattan distance from valid cells to Pacman
-        distances = np.array([abs(nr - p_pos[0]) + abs(nc - p_pos[1]) for nr, nc in valid_moves], dtype=float)
-        
-        # Convert distances to weights (Squared to amplify the desire to escape)
-        weights = distances ** 2 
-        
-        total_weight = weights.sum()
-        if total_weight == 0:
-            probs = np.ones(len(valid_moves)) / len(valid_moves)
-        else:
-            probs = weights / total_weight
+                valid_moves.append(m)
+
+        if not valid_moves: return Move.STAY, 1 
+
+        # Laser sight kill-shot (Direct line of sight sprint)
+        if enemy_position:
+            dr, dc = enemy_position[0] - my_position[0], enemy_position[1] - my_position[1]
+            if dr == 0 or dc == 0:
+                direct_mv = Move.UP if dr < 0 else Move.DOWN if dr > 0 else Move.LEFT if dc < 0 else Move.RIGHT
+                dist = abs(dr) + abs(dc)
+                clear_sight = True
+                for s in range(1, dist):
+                    if map_state[my_position[0] + direct_mv.value[0]*s, my_position[1] + direct_mv.value[1]*s] == 1:
+                        clear_sight = False; break
+                if clear_sight and dist <= self.pacman_speed:
+                    return direct_mv, dist
+
+        # Core Anti-Loop path selection
+        best_move = valid_moves[0]
+        min_cost = float('inf')
+
+        for m in valid_moves:
+            endpoint, steps_taken, path_cells = self._simulate_sprint(my_position, m, map_state)
+            cost = self._dist(endpoint, target)
             
-        return list(zip(valid_moves, probs))
+            # DEATH PENALTY FOR LOOPS: 1000 point penalty for stepping on recent path
+            for cell in path_cells:
+                if cell in self.history:
+                    cost += 1000 
 
-    def _astar_speed_engine(self, map_state, start, goal):
-        """
-        Speed-aware A* Search.
-        Considers 1 turn (dashing from 1 to max_speed cells) as cost = 1.
-        Safely traverses the fog (-1) because the static wall map (1) is fully known.
-        """
-        if start == goal:
-            return Move.STAY, 1
-            
-        h, w = map_state.shape
-        # Admissible Heuristic = Distance / Speed
-        h_func = lambda p: (abs(p[0] - goal[0]) + abs(p[1] - goal[1])) / self.pacman_speed
-        
-        frontier = [(h_func(start), 0, start, None, None)]
-        visited = {start: 0}
+            if cost < min_cost:
+                min_cost = cost
+                best_move = m
 
-        while frontier:
-            _, cost, curr, f_move, f_steps = heapq.heappop(frontier)
-            if curr == goal:
-                return f_move, f_steps
+        # Failsafe: If trapped in a corner with all paths penalized, clear history and pick a random escape route
+        if min_cost >= 1000:
+            self.history.clear() 
+            self.rush_mode = False
+            best_move = random.choice(valid_moves)
 
-            for move_enum in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                dr, dc = move_enum.value
-                for n in range(1, self.pacman_speed + 1):
-                    nxt = (curr[0] + dr * n, curr[1] + dc * n)
-                    
-                    # Boundary check
-                    if not (0 <= nxt[0] < h and 0 <= nxt[1] < w): 
-                        break
-                    
-                    # Strictly prevent dashing through walls (1)
-                    if map_state[nxt[0], nxt[1]] == 1: 
-                        break 
-                    
-                    new_cost = cost + 1
-                    if new_cost < visited.get(nxt, float('inf')):
-                        visited[nxt] = new_cost
-                        priority = new_cost + h_func(nxt)
-                        next_f_move = f_move if f_move else move_enum
-                        next_f_steps = f_steps if f_steps else n
-                        heapq.heappush(frontier, (priority, new_cost, nxt, next_f_move, next_f_steps))
-                        
-        # Random fallback to avoid crashes if no path is found
-        return Move.STAY, 1
+        # Append execution path to history
+        _, final_steps, final_path = self._simulate_sprint(my_position, best_move, map_state)
+        for cell in final_path:
+            self.history.append(cell)
 
-    def _get_line_of_sight_move(self, start, end, map_state):
-        """Checks for a clear line of sight between Pacman and Ghost."""
-        dr, dc = end[0] - start[0], end[1] - start[1]
-        if dr != 0 and dc != 0: return None # Not on the same axis
-        
-        move = Move.UP if dr < 0 else Move.DOWN if dr > 0 else Move.LEFT if dc < 0 else Move.RIGHT
-        dist = abs(dr) + abs(dc)
-        
-        # Check for walls along the path
-        for s in range(1, dist):
-            chk_r = start[0] + move.value[0] * s
-            chk_c = start[1] + move.value[1] * s
-            if map_state[chk_r, chk_c] == 1: 
-                return None
-        return move
+        return best_move, final_steps
+
+    def _simulate_sprint(self, pos, move, map_state):
+        """Simulates a sprint based on pacman_speed. Returns endpoint, steps, and traversed cells."""
+        steps = 0
+        curr = pos
+        path_cells = []
+        for _ in range(self.pacman_speed):
+            nr, nc = curr[0] + move.value[0], curr[1] + move.value[1]
+            if 0 <= nr < map_state.shape[0] and 0 <= nc < map_state.shape[1] and map_state[nr, nc] != 1:
+                steps += 1
+                curr = (nr, nc)
+                path_cells.append(curr)
+            else:
+                break
+        return curr, max(1, steps), path_cells
+
 
 class GhostAgent(BaseGhostAgent):
     """
